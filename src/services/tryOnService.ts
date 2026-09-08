@@ -474,7 +474,7 @@ export const tryOnService = {
       onPhaseChange?.('detecting_pose', 'AI model detecting body contours & pose alignment...');
 
       let attempts = 0;
-      const maxAttempts = 40; // 40 seconds timeout
+      const maxAttempts = 180; // 3 minutes timeout
 
       while (attempts < maxAttempts) {
         await new Promise((r) => setTimeout(r, 1000));
