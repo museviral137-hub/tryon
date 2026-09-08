@@ -1,0 +1,6 @@
+{
+  "name": "VestiAI",
+  "description": "AI Trial Room for Your Shop - Mobile-first virtual trial room and saved garment management for clothing retailers.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
