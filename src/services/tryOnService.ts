@@ -42,7 +42,7 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 
 /**
  * Validate customer category and compatibility
- * Supported PixelAPI categories: upperbody, lowerbody, dress, saree, lehenga, kurti, sherwani
+ * Supported virtual try-on categories: upperbody, lowerbody, dress, saree, lehenga, kurti, sherwani
  */
 function validateCategoryClient(category?: string): { valid: boolean; error?: string } {
   if (!category || !category.trim()) {
@@ -241,7 +241,7 @@ export const tryOnService = {
       validateGarmentRecord(garment, shopId),
     ]);
 
-    onPhaseChange?.('preparing', 'Initiating boutique try-on request with PixelAPI backend...');
+    onPhaseChange?.('preparing', 'Initiating boutique try-on request with TryOnCloud backend...');
 
     // 6. Call Supabase Edge Function: generate-tryon
     let edgeData: any = null;
@@ -368,8 +368,8 @@ export const tryOnService = {
         errorMsg = 'Your account is not linked to an active boutique shop.';
         creditDeducted = false;
         wasRefunded = false;
-      } else if (errorCode === 'PIXELAPI_NOT_CONFIGURED' || errorMsg.includes('PIXELAPI_API_KEY')) {
-        errorMsg = 'PixelAPI is not configured. Please add PIXELAPI_API_KEY to your Supabase Edge Function environment variables.';
+      } else if (errorCode === 'TRYONCLOUD_NOT_CONFIGURED') {
+        errorMsg = 'Virtual Try-On provider is not configured. Please contact support.';
         creditDeducted = false;
         wasRefunded = false;
       } else if (errorCode === 'ENTITY_NOT_FOUND' || errorMsg.includes('not found in boutique catalog')) {
@@ -408,11 +408,11 @@ export const tryOnService = {
         creditDeducted = errorJson?.creditDeducted === true;
         wasRefunded = errorJson?.wasRefunded === true && creditDeducted;
       } else if (
-        errorCode === 'PIXELAPI_ERROR' ||
-        errorMsg.includes('PixelAPI') ||
+        errorCode === 'TRYONCLOUD_ERROR' ||
+        errorMsg.includes('TryOnCloud') ||
         errorMsg.includes('Virtual Try-On provider')
       ) {
-        errorMsg = errorJson?.message || errorJson?.pixelApiError || errorMsg;
+        errorMsg = errorJson?.message || errorJson?.providerError || errorMsg;
         creditDeducted = errorJson?.creditDeducted === true;
         wasRefunded = errorJson?.wasRefunded === true && creditDeducted;
       } else if (errorCode === 'IMAGE_SAVE_FAILED') {
@@ -435,7 +435,7 @@ export const tryOnService = {
       throw new TryOnError(errMsg, { wasRefunded: false, creditDeducted: false });
     }
 
-    // Handle immediate synchronous completion from PixelAPI
+    // Handle immediate synchronous completion from the provider
     if (edgeData.status === 'Completed' && edgeData.resultImageUrl) {
       onPhaseChange?.('completed', 'Try-On generation complete!');
 

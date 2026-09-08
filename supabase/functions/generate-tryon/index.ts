@@ -1,15 +1,15 @@
 // Supabase Edge Function: generate-tryon
-// Integrates with PixelAPI Virtual Try-On API (POST https://api.pixelapi.dev/v1/virtual-tryon)
+// Integrates with the TryOnCloud Developer API.
 // Strict production execution pipeline:
 // 1. Authenticate user from Bearer Token
 // 2. Verify active boutique shop membership
 // 3. Validate real customer & garment DB records for this shop
-// 4. Validate garment category compatibility against PixelAPI enum ('upperbody' | 'lowerbody' | 'dress' | 'saree' | 'lehenga' | 'kurti' | 'sherwani')
+// 4. Validate garment category compatibility before charging credits
 // 5. Resolve accessible HTTPS URLs for customer and garment images with pre-flight availability check BEFORE credit deduction
-// 6. Verify PIXELAPI_API_KEY exists before credit deduction (no fake success fallback)
+// 6. Verify TRYONCLOUD_API_KEY exists before credit deduction (no fake success fallback)
 // 7. Insert Try-On Result row in 'Processing' status FIRST
 // 8. Deduct exactly 1 credit atomically via stored procedure deduct_shop_ai_credit
-// 9. Call PixelAPI Virtual Try-On API with verified parameters
+// 9. Call TryOnCloud with verified image files
 // 10. On provider/storage failure: refund ONLY if credit was deducted (creditDeducted=true, wasRefunded=true)
 
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
@@ -22,20 +22,20 @@ const corsHeaders = {
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export type PixelAPICategory = 'upperbody' | 'lowerbody' | 'dress';
+export type TryOnCategory = 'upperbody' | 'lowerbody' | 'dress';
 
-type PixelAPICategoryResult =
-  | { success: true; category: PixelAPICategory }
+type TryOnCategoryResult =
+  | { success: true; category: TryOnCategory }
   | { success: false; error: string; unsupportedCategory?: string };
 
 /**
  * Centralized Category Mapping Function
- * Maps boutique catalog categories to PixelAPI's exact 3 categories:
+ * Maps supported boutique catalog categories to the existing fitting categories:
  * - 'upperbody': shirt, top, t-shirt, tshirt, blouse, jacket, blazer, sweater, hoodie, crop top
  * - 'lowerbody': pant, pants, trouser, trousers, skirt, jeans, shorts, palazzo, leggings, dhoti
  * - 'dress'    : dress, frock, gown, jumpsuit, one-piece, saree, sari, lehenga, kurti, kurta, anarkali, sherwani, achkan, suit
  */
-function validateAndMapCategory(category?: string, garmentName?: string): PixelAPICategoryResult {
+function validateAndMapCategory(category?: string, garmentName?: string): TryOnCategoryResult {
   const catRaw = (category || '').trim();
   const nameRaw = (garmentName || '').trim();
   const raw = catRaw || nameRaw;
@@ -298,90 +298,29 @@ async function verifyImageAccessible(url: string): Promise<{
 }
 
 type ImagePayload = {
-  base64: string;
+  blob: Blob;
   mimeType: string;
   byteSize: number;
-  width?: number;
-  height?: number;
-  hadDataUrlPrefix: boolean;
 };
 
-function getImageDimensions(bytes: Uint8Array, mimeType: string): { width?: number; height?: number } {
-  if (mimeType === 'image/png' && bytes.length >= 24) {
-    return {
-      width: new DataView(bytes.buffer, bytes.byteOffset).getUint32(16),
-      height: new DataView(bytes.buffer, bytes.byteOffset).getUint32(20),
-    };
-  }
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png']);
 
-  if (mimeType === 'image/webp' && bytes.length >= 30 &&
-      bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
-    const subtype = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
-    if (subtype === 'VP8X') {
-      const width = 1 + bytes[24] + (bytes[25] << 8) + (bytes[26] << 16);
-      const height = 1 + bytes[27] + (bytes[28] << 8) + (bytes[29] << 16);
-      return { width, height };
-    }
-  }
-
-  if (mimeType === 'image/jpeg' && bytes.length > 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
-    let offset = 2;
-    while (offset + 9 < bytes.length) {
-      if (bytes[offset] !== 0xff) {
-        offset += 1;
-        continue;
-      }
-      const marker = bytes[offset + 1];
-      if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
-        offset += 2;
-        continue;
-      }
-      const segmentLength = (bytes[offset + 2] << 8) | bytes[offset + 3];
-      if (segmentLength < 2 || offset + segmentLength + 2 > bytes.length) break;
-      const isStartOfFrame = marker >= 0xc0 && marker <= 0xc3 || marker >= 0xc5 && marker <= 0xc7 || marker >= 0xc9 && marker <= 0xcb || marker >= 0xcd && marker <= 0xcf;
-      if (isStartOfFrame && offset + 8 < bytes.length) {
-        return {
-          height: (bytes[offset + 5] << 8) | bytes[offset + 6],
-          width: (bytes[offset + 7] << 8) | bytes[offset + 8],
-        };
-      }
-      offset += segmentLength + 2;
-    }
-  }
-
-  return {};
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunkSize, bytes.length)));
-  }
-  return btoa(binary).trim();
-}
-
-/** Downloads an image and converts it to raw Base64 without a data URL prefix. */
-async function imageUrlToBase64(url: string): Promise<ImagePayload> {
+/** Downloads an image as a bounded multipart-ready Blob. */
+async function imageUrlToBlob(url: string): Promise<ImagePayload> {
   if (!url || typeof url !== 'string') {
-    throw new Error('Image URL is required for Base64 conversion.');
+    throw new Error('Image URL is required.');
   }
 
-  // If already a Data URL, extract the base64 part directly
   if (url.startsWith('data:')) {
     const commaIdx = url.indexOf(',');
     if (commaIdx !== -1) {
       const mimeType = url.slice(5, url.indexOf(';')) || 'application/octet-stream';
-      const base64 = url.substring(commaIdx + 1).replace(/\s/g, '');
-      const binary = atob(base64);
+      if (!SUPPORTED_IMAGE_TYPES.has(mimeType)) throw new Error('Only JPEG and PNG images are supported.');
+      const binary = atob(url.substring(commaIdx + 1).replace(/\s/g, ''));
+      if (binary.length > MAX_IMAGE_BYTES) throw new Error('Image exceeds the 15 MB size limit.');
       const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-      return {
-        base64,
-        mimeType,
-        byteSize: bytes.byteLength,
-        ...getImageDimensions(bytes, mimeType),
-        hadDataUrlPrefix: true,
-      };
+      return { blob: new Blob([bytes], { type: mimeType }), mimeType, byteSize: bytes.byteLength };
     }
   }
 
@@ -391,31 +330,17 @@ async function imageUrlToBase64(url: string): Promise<ImagePayload> {
     throw new Error(`Failed to download image: HTTP ${response.status}`);
   }
 
-  const contentType = response.headers.get('content-type') || '';
-
-  // Allow standard image mime-types and generic binary payloads
-  if (
-    contentType &&
-    !contentType.includes('image/') &&
-    !contentType.includes('application/octet-stream') &&
-    !contentType.includes('binary')
-  ) {
-    throw new Error(`Unsupported image content type: ${contentType}`);
-  }
+  const mimeType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!SUPPORTED_IMAGE_TYPES.has(mimeType)) throw new Error('Only JPEG and PNG images are supported.');
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > MAX_IMAGE_BYTES) throw new Error('Image exceeds the 15 MB size limit.');
 
   const buffer = await response.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-
-  return {
-    base64: bytesToBase64(bytes),
-    mimeType: contentType || 'application/octet-stream',
-    byteSize: bytes.byteLength,
-    ...getImageDimensions(bytes, contentType),
-    hadDataUrlPrefix: false,
-  };
+  if (buffer.byteLength === 0 || buffer.byteLength > MAX_IMAGE_BYTES) throw new Error('Image exceeds the 15 MB size limit.');
+  return { blob: new Blob([buffer], { type: mimeType }), mimeType, byteSize: buffer.byteLength };
 }
 
-function sanitizePixelApiResponseBody(rawBody: string): string {
+function sanitizeProviderResponseBody(rawBody: string): string {
   if (!rawBody.trim()) return '[empty body]';
   try {
     const value = JSON.parse(rawBody);
@@ -440,11 +365,10 @@ function providerResponseStatus(status: number): number {
 }
 
 /**
- * Safely parses any error payload from PixelAPI (supporting string, detail array, nested errors)
- * Format: "PixelAPI HTTP <status>: <actual provider message>"
+ * Safely parses a provider error without exposing URLs or credentials.
  */
-function extractPixelApiErrorMessage(status: number, errText: string): string {
-  const prefix = `PixelAPI HTTP ${status}`;
+function extractProviderErrorMessage(status: number, errText: string): string {
+  const prefix = `TryOnCloud HTTP ${status}`;
   if (!errText || !errText.trim()) {
     return `${prefix}: Provider rejected request with status ${status}`;
   }
@@ -471,8 +395,6 @@ function extractPixelApiErrorMessage(status: number, errText: string): string {
       return `${prefix}: ${sanitizeUrlForLogging(json.detail)}`;
     }
 
-    // PixelAPI's documented Virtual Try-On error shape (pixelapi.dev/docs#virtual-tryon):
-    // { "detail": { "error": "invalid_image", "message": "...", "guidance": "...", "received_size": "48x32px" } }
     if (json.detail && typeof json.detail === 'object' && !Array.isArray(json.detail)) {
       const d = json.detail;
       const parts: string[] = [];
@@ -645,7 +567,7 @@ serve(async (req: Request) => {
       );
     }
 
-    // 4. Verify Garment Category mapping with PixelAPI (PRE-DEDUCTION VALIDATION)
+    // 4. Verify garment category before deduction
     const categoryMapping = validateAndMapCategory(garment.category, garment.name);
     if (!categoryMapping.success) {
       return new Response(
@@ -659,7 +581,6 @@ serve(async (req: Request) => {
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    const vtonCategory = categoryMapping.category;
 
     // 5. Resolve Accessible Image URLs BEFORE credit deduction
     const [customerPhotoUrl, garmentPhotoUrl] = await Promise.all([
@@ -711,27 +632,26 @@ serve(async (req: Request) => {
 
     // SAFE DIAGNOSTICS LOGGING (No secrets or auth tokens logged)
     console.info(
-      `[PixelAPI Diagnostics - Request Prep]\n` +
+      `[TryOnCloud Diagnostics - Request Prep]\n` +
       `  Customer UUID: ${customer.id}\n` +
       `  Garment UUID: ${garment.id}\n` +
       `  Database Category: "${garment.category}"\n` +
-      `  Mapped PixelAPI Category: "${vtonCategory}"\n` +
+      `  Mapped Category: "${categoryMapping.category}"\n` +
       `  Customer Image Path: ${sanitizeUrlForLogging(customerPhotoUrl)}\n` +
       `  Customer Image HTTP Status: ${customerImgCheck.status} (${customerImgCheck.contentType})\n` +
       `  Garment Image Path: ${sanitizeUrlForLogging(garmentPhotoUrl)}\n` +
       `  Garment Image HTTP Status: ${garmentImgCheck.status} (${garmentImgCheck.contentType})\n` +
-      `  PixelAPI Endpoint: POST https://api.pixelapi.dev/v1/virtual-tryon\n` +
-      `  Content-Type: application/json\n` +
-      `  Payload format: Base64 images with category "${vtonCategory}"`
+      `  TryOnCloud Endpoint: POST https://www.tryoncloud.com/api/v1/generate\n` +
+      `  Payload format: multipart/form-data image files`
     );
 
-    // 6. Verify PIXELAPI_API_KEY before credit deduction or job creation (NO fake fallback)
-    const pixelApiKey = Deno.env.get('PIXELAPI_API_KEY');
-    if (!pixelApiKey || !pixelApiKey.trim()) {
+    // 6. Verify the provider key before credit deduction
+    const tryOnCloudApiKey = Deno.env.get('TRYONCLOUD_API_KEY');
+    if (!tryOnCloudApiKey || !tryOnCloudApiKey.trim()) {
       return new Response(
         JSON.stringify({
-          error: 'PIXELAPI_NOT_CONFIGURED',
-          message: 'PIXELAPI_API_KEY environment variable is not configured in Supabase Edge Functions.',
+          error: 'TRYONCLOUD_NOT_CONFIGURED',
+          message: 'Try-on provider is not configured. Please contact support.',
           creditDeducted: false,
           wasRefunded: false,
         }),
@@ -817,23 +737,19 @@ serve(async (req: Request) => {
 
     const creditRemaining = deduction?.remaining_credits ?? 0;
 
-    // 10. Convert images to BASE64 and call PixelAPI Virtual Try-On API (POST https://api.pixelapi.dev/v1/virtual-tryon)
-    // PixelAPI contract:
-    // person_image: <base64 image WITHOUT data:image/... prefix>
-    // garment_image: <base64 image WITHOUT data:image/... prefix>
-    // category: "upperbody" | "lowerbody" | "dress"
+    // 10. Convert the existing storage images to multipart files and call TryOnCloud.
     try {
       let personImage: ImagePayload;
       let garmentImage: ImagePayload;
 
       try {
         [personImage, garmentImage] = await Promise.all([
-          imageUrlToBase64(customerPhotoUrl),
-          imageUrlToBase64(garmentPhotoUrl),
+          imageUrlToBlob(customerPhotoUrl),
+          imageUrlToBlob(garmentPhotoUrl),
         ]);
       } catch (prepErr) {
-        const prepMsg = (prepErr as Error).message || 'Failed to download or encode input images';
-        console.error(`[PixelAPI Image Preparation Error] ${prepMsg}`);
+        const prepMsg = (prepErr as Error).message || 'Failed to download input images';
+        console.error(`[TryOnCloud Image Preparation Error] ${prepMsg}`);
 
         // Refund credit atomically if image conversion fails after deduction
         await supabaseAdmin.rpc('refund_shop_ai_credit', {
@@ -862,45 +778,51 @@ serve(async (req: Request) => {
         );
       }
 
-      const requestPayload = {
-        person_image: personImage.base64,
-        garment_image: garmentImage.base64,
-        category: vtonCategory,
-      };
-
-      console.info(
-        `[PixelAPI Request] endpoint=/v1/virtual-tryon method=POST content_type=application/json ` +
-        `user_agent=BoutiqueVirtualTryon/1.0 category="${vtonCategory}" ` +
-        `person_image={format:raw_base64,mime:${personImage.mimeType},bytes:${personImage.byteSize},base64_length:${personImage.base64.length},data_url_prefix:${personImage.hadDataUrlPrefix},dimensions:${personImage.width || 'unknown'}x${personImage.height || 'unknown'}} ` +
-        `garment_image={format:raw_base64,mime:${garmentImage.mimeType},bytes:${garmentImage.byteSize},base64_length:${garmentImage.base64.length},data_url_prefix:${garmentImage.hadDataUrlPrefix},dimensions:${garmentImage.width || 'unknown'}x${garmentImage.height || 'unknown'}}`
+      const formData = new FormData();
+      formData.append(
+        'person_image',
+        personImage.blob,
+        `person.${personImage.mimeType === 'image/png' ? 'png' : 'jpg'}`
+      );
+      formData.append(
+        'garment_image',
+        garmentImage.blob,
+        `garment.${garmentImage.mimeType === 'image/png' ? 'png' : 'jpg'}`
       );
 
-      const pixelResponse = await fetch('https://api.pixelapi.dev/v1/virtual-tryon', {
+      console.info(
+        `[TryOnCloud Request] endpoint=/api/v1/generate method=POST content_type=multipart/form-data ` +
+        `user_agent=BoutiqueVirtualTryon/1.0 ` +
+        `person_image={format:blob,mime:${personImage.mimeType},bytes:${personImage.byteSize}} ` +
+        `garment_image={format:blob,mime:${garmentImage.mimeType},bytes:${garmentImage.byteSize}}`
+      );
+
+      const endpoint = 'https://www.tryoncloud.com/api/v1/generate';
+      const tryOnResponse = await fetch(endpoint, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${pixelApiKey.trim()}`,
-          'Content-Type': 'application/json',
+          'X-API-KEY': tryOnCloudApiKey.trim(),
           'User-Agent': 'BoutiqueVirtualTryon/1.0',
         },
-        body: JSON.stringify(requestPayload),
+        body: formData,
       });
 
-      if (!pixelResponse.ok) {
-        const errorText = await pixelResponse.text();
+      if (!tryOnResponse.ok) {
+        const errorText = await tryOnResponse.text();
 
-        const providerMessage = extractPixelApiErrorMessage(
-          pixelResponse.status,
+        const providerMessage = extractProviderErrorMessage(
+          tryOnResponse.status,
           errorText
         );
 
         console.error(
-          `[PixelAPI Response] status=${pixelResponse.status} body=${sanitizePixelApiResponseBody(errorText)} message=${providerMessage}`
+          `[TryOnCloud Response] status=${tryOnResponse.status} body=${sanitizeProviderResponseBody(errorText)} message=${providerMessage}`
         );
 
         await supabaseAdmin.rpc('refund_shop_ai_credit', {
           p_shop_id: shopId,
           p_try_on_id: resultId,
-          p_reason: `PixelAPI HTTP ${pixelResponse.status}: ${providerMessage}`,
+          p_reason: `TryOnCloud HTTP ${tryOnResponse.status}: ${providerMessage}`,
         });
 
         await supabaseAdmin
@@ -914,14 +836,14 @@ serve(async (req: Request) => {
 
         return new Response(
           JSON.stringify({
-            error: 'PIXELAPI_ERROR',
+            error: 'TRYONCLOUD_ERROR',
             message: providerMessage,
-            pixelApiStatus: pixelResponse.status,
+            providerStatus: tryOnResponse.status,
             creditDeducted: true,
             wasRefunded: true,
           }),
           {
-            status: providerResponseStatus(pixelResponse.status),
+            status: providerResponseStatus(tryOnResponse.status),
             headers: {
               ...corsHeaders,
               'Content-Type': 'application/json',
@@ -930,149 +852,27 @@ serve(async (req: Request) => {
         );
       }
 
-      const pixelData = await pixelResponse.json();
-      const jobId =
-        pixelData.job_id ||
-        pixelData.generation_id ||
-        pixelData.id;
-
-      if (!jobId) {
-        throw new Error('PixelAPI did not return a job ID.');
+      // TryOnCloud returns the generated PNG directly in the response body.
+      if (!tryOnResponse.headers.get('content-type')?.includes('image/')) {
+        throw new Error('TryOnCloud returned an invalid image response.');
       }
 
-      console.info(
-        `[PixelAPI Response] status=${pixelResponse.status} job_id_present=true ` +
-        `immediate_status=${pixelData.status || 'queued'} result_url_present=${Boolean(pixelData.output_url || pixelData.result_url || pixelData.result_image_url || (Array.isArray(pixelData.result_urls) && pixelData.result_urls.length > 0))} ` +
-        `result_base64_present=${Boolean(pixelData.result_image_b64 || pixelData.image_base64)}`
-      );
-
-      const initialResultUrls = Array.isArray(pixelData.result_urls) ? pixelData.result_urls : [];
-      let outputUrl =
-        (initialResultUrls.length > 0 ? initialResultUrls[0] : null) ||
-        pixelData.output_url ||
-        pixelData.result_url ||
-        pixelData.result_image_url;
-      let base64Image = pixelData.result_image_b64 || pixelData.image_base64;
-
-      // Active Server-Side Polling: allow the documented async processing window to resolve the job directly.
-      // Poll GET /v1/virtual-tryon/jobs/{job_id} for up to 120 seconds.
-      if (!outputUrl && !base64Image && jobId) {
-        const pollStartTime = Date.now();
-        const maxPollMs = 120000;
-
-        while (Date.now() - pollStartTime < maxPollMs) {
-          await new Promise((r) => setTimeout(r, 2000));
-
-          try {
-            const pollRes = await fetch(`https://api.pixelapi.dev/v1/virtual-tryon/jobs/${jobId}`, {
-              method: 'GET',
-              headers: {
-                'Authorization': `Bearer ${pixelApiKey.trim()}`,
-                'User-Agent': 'BoutiqueVirtualTryon/1.0',
-              },
-            });
-
-            if (pollRes.ok) {
-              const pollJson = await pollRes.json();
-              const pollStatus = (pollJson.status || '').toLowerCase();
-              console.info(
-                `[PixelAPI Poll Response] status=${pollRes.status} job_status=${pollStatus || 'unknown'} ` +
-                `result_url_present=${Boolean(pollJson.output_url || pollJson.result_url || pollJson.result_image_url || (Array.isArray(pollJson.result_urls) && pollJson.result_urls.length > 0))} ` +
-                `result_base64_present=${Boolean(pollJson.result_image_b64 || pollJson.image_base64)}`
-              );
-              const pollResultUrls = Array.isArray(pollJson.result_urls) ? pollJson.result_urls : [];
-              const pollOutputUrl =
-                (pollResultUrls.length > 0 ? pollResultUrls[0] : null) ||
-                pollJson.output_url ||
-                pollJson.result_url ||
-                pollJson.result_image_url;
-              const pollBase64 = pollJson.result_image_b64 || pollJson.image_base64;
-
-              if (pollStatus === 'completed' || pollStatus === 'succeeded' || pollOutputUrl || pollBase64) {
-                outputUrl = pollOutputUrl;
-                base64Image = pollBase64;
-                console.info(`[PixelAPI] Job ${jobId} completed successfully during server polling.`);
-                break;
-              } else if (pollStatus === 'failed' || pollStatus === 'error') {
-                const failReason = extractPixelApiErrorMessage(
-                  pollRes.status,
-                  JSON.stringify(pollJson)
-                );
-                console.error(`[PixelAPI Poll Response] status=${pollRes.status} body=${sanitizePixelApiResponseBody(JSON.stringify(pollJson))} message=${failReason}`);
-
-                // Refund credit atomically on provider job failure
-                await supabaseAdmin.rpc('refund_shop_ai_credit', {
-                  p_shop_id: shopId,
-                  p_try_on_id: resultId,
-                  p_reason: `PixelAPI job failed: ${failReason}`,
-                });
-
-                await supabaseAdmin
-                  .from('try_on_results')
-                  .update({
-                    status: 'Failed',
-                    progress_phase: 'failed',
-                    error_message: failReason,
-                  })
-                  .eq('id', resultId);
-
-                return new Response(
-                  JSON.stringify({
-                    error: 'PIXELAPI_ERROR',
-                    message: failReason,
-                    pixelApiStatus: pollRes.status,
-                    creditDeducted: true,
-                    wasRefunded: true,
-                  }),
-                  { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-                );
-              } else if (pollStatus === 'queued' || pollStatus === 'processing') {
-                continue;
-              }
-            }
-          } catch (pollErr) {
-            console.warn(`[PixelAPI] Non-blocking notice during job polling: ${(pollErr as Error).message}`);
-          }
-        }
-      }
-
-      if (pixelData.status === 'completed' || outputUrl || base64Image) {
+      {
         let storageFilePath = `tryon-results/${shopId}/${resultId}.png`;
         let imageSaved = false;
 
         try {
-          let imageBlob: Blob | null = null;
-          if (outputUrl) {
-            const imgRes = await fetch(outputUrl);
-            if (imgRes.ok) {
-              imageBlob = await imgRes.blob();
-            }
-          } else if (base64Image) {
-            const cleanB64 = base64Image.replace(/^data:image\/\w+;base64,/, '');
-            const binary = atob(cleanB64);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) {
-              bytes[i] = binary.charCodeAt(i);
-            }
-            imageBlob = new Blob([bytes], { type: 'image/png' });
-          }
-
-          if (imageBlob && imageBlob.size > 0) {
-            const uploadPath = `${shopId}/${resultId}.png`;
-            const { error: uploadErr } = await supabaseAdmin.storage
-              .from('tryon-results')
-              .upload(uploadPath, imageBlob, {
-                contentType: 'image/png',
-                upsert: true,
-              });
-
-            if (!uploadErr) {
-              storageFilePath = `tryon-results/${uploadPath}`;
-              imageSaved = true;
-            }
+          const imageBlob = new Blob([await tryOnResponse.arrayBuffer()], { type: 'image/png' });
+          const uploadPath = `${shopId}/${resultId}.png`;
+          const { error: uploadErr } = await supabaseAdmin.storage
+            .from('tryon-results')
+            .upload(uploadPath, imageBlob, { contentType: 'image/png', upsert: true });
+          if (!uploadErr && imageBlob.size > 0) {
+            storageFilePath = `tryon-results/${uploadPath}`;
+            imageSaved = true;
           }
         } catch (saveErr) {
-          console.error('Error saving PixelAPI image to Supabase storage:', (saveErr as Error).message);
+          console.error('Error saving TryOnCloud image to Supabase storage:', (saveErr as Error).message);
         }
 
         if (!imageSaved) {
@@ -1107,7 +907,6 @@ serve(async (req: Request) => {
         await supabaseAdmin
           .from('try_on_results')
           .update({
-            job_id: jobId,
             status: 'Completed',
             progress_phase: 'completed',
             result_image_url: storageFilePath,
@@ -1123,7 +922,7 @@ serve(async (req: Request) => {
           JSON.stringify({
             success: true,
             resultId,
-            jobId,
+            jobId: null,
             status: 'Completed',
             phase: 'completed',
             resultImageUrl: signedRes?.signedUrl || storageFilePath,
@@ -1133,35 +932,14 @@ serve(async (req: Request) => {
         );
       }
 
-      // Asynchronous job successfully accepted by PixelAPI
-      await supabaseAdmin
-        .from('try_on_results')
-        .update({
-          job_id: jobId,
-          status: 'Processing',
-          progress_phase: 'detecting_pose',
-        })
-        .eq('id', resultId);
-
-      return new Response(
-        JSON.stringify({
-          success: true,
-          resultId,
-          jobId,
-          status: 'Processing',
-          phase: 'detecting_pose',
-          remainingCredits: creditRemaining,
-        }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
     } catch (fetchErr) {
-      console.error('Fetch exception communicating with PixelAPI:', (fetchErr as Error).message);
+      console.error('Fetch exception communicating with TryOnCloud:', (fetchErr as Error).message);
 
       // Rollback credit on network failure
       await supabaseAdmin.rpc('refund_shop_ai_credit', {
         p_shop_id: shopId,
         p_try_on_id: resultId,
-        p_reason: 'Network failure connecting to PixelAPI',
+        p_reason: 'Network failure connecting to TryOnCloud',
       });
 
       await supabaseAdmin
