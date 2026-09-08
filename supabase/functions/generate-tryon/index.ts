@@ -954,11 +954,11 @@ serve(async (req: Request) => {
         pixelData.result_image_url;
       let base64Image = pixelData.result_image_b64 || pixelData.image_base64;
 
-      // Active Server-Side Polling: PixelAPI virtual try-on jobs take ~12-18 seconds.
-      // Poll GET /v1/virtual-tryon/jobs/{job_id} for up to 26 seconds to resolve directly.
+      // Active Server-Side Polling: allow the documented async processing window to resolve the job directly.
+      // Poll GET /v1/virtual-tryon/jobs/{job_id} for up to 120 seconds.
       if (!outputUrl && !base64Image && jobId) {
         const pollStartTime = Date.now();
-        const maxPollMs = 26000;
+        const maxPollMs = 120000;
 
         while (Date.now() - pollStartTime < maxPollMs) {
           await new Promise((r) => setTimeout(r, 2000));
@@ -1026,6 +1026,8 @@ serve(async (req: Request) => {
                   }),
                   { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
                 );
+              } else if (pollStatus === 'queued' || pollStatus === 'processing') {
+                continue;
               }
             }
           } catch (pollErr) {
