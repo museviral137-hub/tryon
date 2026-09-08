@@ -21,11 +21,9 @@ export const MAX_GARMENT_IMAGE_SIZE = 10 * 1024 * 1024;  // 10MB
 export const MAX_SHOP_ASSET_SIZE = 5 * 1024 * 1024;      // 5MB
 export const MAX_TRYON_RESULT_SIZE = 15 * 1024 * 1024;   // 15MB
 
-// PixelAPI (the Virtual Try-On provider) rejects requests with HTTP 400 when input
-// images are very high-resolution / large, since person+garment images are sent as
-// base64 JSON. Full-resolution phone camera photos (12MP+, several MB) routinely
-// trip this. We downscale + compress on upload so nothing oversized ever reaches it.
-export const MAX_UPLOAD_DIMENSION = 1600; // longest edge, in px
+// Keep uploaded VTON inputs within the provider's documented working dimensions
+// before they are encoded into the JSON request.
+export const MAX_UPLOAD_DIMENSION = 1024; // longest edge, in px
 export const UPLOAD_JPEG_QUALITY = 0.88;
 
 function fileToDataUrl(file: File | Blob): Promise<string> {
@@ -595,10 +593,10 @@ export const storageService = {
       throw new Error(`Failed to upload try-on result: ${uploadError.message}`);
     }
 
-    // Generate signed URL (expires in 24 hours / 86400s) for private bucket display
+    // Generate signed URL (expires in 1 hour / 3600s) for private bucket display
     const { data: signedData, error: signError } = await supabase.storage
       .from('tryon-results')
-      .createSignedUrl(filePath, 86400);
+      .createSignedUrl(filePath, 3600);
 
     const signedUrl = signError || !signedData ? filePath : signedData.signedUrl;
 

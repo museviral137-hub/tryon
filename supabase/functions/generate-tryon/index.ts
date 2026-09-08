@@ -297,10 +297,72 @@ async function verifyImageAccessible(url: string): Promise<{
   }
 }
 
-/**
- * Downloads an image from an accessible URL and converts it to a raw Base64 string (without data: prefix)
- */
-async function imageUrlToBase64(url: string): Promise<string> {
+type ImagePayload = {
+  base64: string;
+  mimeType: string;
+  byteSize: number;
+  width?: number;
+  height?: number;
+  hadDataUrlPrefix: boolean;
+};
+
+function getImageDimensions(bytes: Uint8Array, mimeType: string): { width?: number; height?: number } {
+  if (mimeType === 'image/png' && bytes.length >= 24) {
+    return {
+      width: new DataView(bytes.buffer, bytes.byteOffset).getUint32(16),
+      height: new DataView(bytes.buffer, bytes.byteOffset).getUint32(20),
+    };
+  }
+
+  if (mimeType === 'image/webp' && bytes.length >= 30 &&
+      bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+    const subtype = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+    if (subtype === 'VP8X') {
+      const width = 1 + bytes[24] + (bytes[25] << 8) + (bytes[26] << 16);
+      const height = 1 + bytes[27] + (bytes[28] << 8) + (bytes[29] << 16);
+      return { width, height };
+    }
+  }
+
+  if (mimeType === 'image/jpeg' && bytes.length > 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < bytes.length) {
+      if (bytes[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = bytes[offset + 1];
+      if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+        offset += 2;
+        continue;
+      }
+      const segmentLength = (bytes[offset + 2] << 8) | bytes[offset + 3];
+      if (segmentLength < 2 || offset + segmentLength + 2 > bytes.length) break;
+      const isStartOfFrame = marker >= 0xc0 && marker <= 0xc3 || marker >= 0xc5 && marker <= 0xc7 || marker >= 0xc9 && marker <= 0xcb || marker >= 0xcd && marker <= 0xcf;
+      if (isStartOfFrame && offset + 8 < bytes.length) {
+        return {
+          height: (bytes[offset + 5] << 8) | bytes[offset + 6],
+          width: (bytes[offset + 7] << 8) | bytes[offset + 8],
+        };
+      }
+      offset += segmentLength + 2;
+    }
+  }
+
+  return {};
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunkSize, bytes.length)));
+  }
+  return btoa(binary).trim();
+}
+
+/** Downloads an image and converts it to raw Base64 without a data URL prefix. */
+async function imageUrlToBase64(url: string): Promise<ImagePayload> {
   if (!url || typeof url !== 'string') {
     throw new Error('Image URL is required for Base64 conversion.');
   }
@@ -309,7 +371,17 @@ async function imageUrlToBase64(url: string): Promise<string> {
   if (url.startsWith('data:')) {
     const commaIdx = url.indexOf(',');
     if (commaIdx !== -1) {
-      return url.substring(commaIdx + 1).replace(/\s/g, '');
+      const mimeType = url.slice(5, url.indexOf(';')) || 'application/octet-stream';
+      const base64 = url.substring(commaIdx + 1).replace(/\s/g, '');
+      const binary = atob(base64);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      return {
+        base64,
+        mimeType,
+        byteSize: bytes.byteLength,
+        ...getImageDimensions(bytes, mimeType),
+        hadDataUrlPrefix: true,
+      };
     }
   }
 
@@ -334,16 +406,37 @@ async function imageUrlToBase64(url: string): Promise<string> {
   const buffer = await response.arrayBuffer();
   const bytes = new Uint8Array(buffer);
 
-  let binary = '';
-  const chunkSize = 0x8000;
+  return {
+    base64: bytesToBase64(bytes),
+    mimeType: contentType || 'application/octet-stream',
+    byteSize: bytes.byteLength,
+    ...getImageDimensions(bytes, contentType),
+    hadDataUrlPrefix: false,
+  };
+}
 
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(
-      ...bytes.subarray(i, Math.min(i + chunkSize, bytes.length))
-    );
+function sanitizePixelApiResponseBody(rawBody: string): string {
+  if (!rawBody.trim()) return '[empty body]';
+  try {
+    const value = JSON.parse(rawBody);
+    const allowed = (input: any): any => {
+      if (Array.isArray(input)) return input.slice(0, 10).map(allowed);
+      if (!input || typeof input !== 'object') return typeof input === 'string' ? sanitizeUrlForLogging(input) : input;
+      const output: Record<string, any> = {};
+      for (const key of ['detail', 'error', 'message', 'friendly_message', 'guidance', 'code', 'status', 'received_size', 'loc', 'type']) {
+        if (input[key] !== undefined) output[key] = allowed(input[key]);
+      }
+      return output;
+    };
+    return JSON.stringify(allowed(value)).slice(0, 1200);
+  } catch {
+    return sanitizeUrlForLogging(rawBody).slice(0, 1200);
   }
+}
 
-  return btoa(binary).trim();
+function providerResponseStatus(status: number): number {
+  if (status === 400 || status === 401 || status === 402 || status === 422 || status === 429) return status;
+  return status >= 500 ? 502 : 502;
 }
 
 /**
@@ -730,11 +823,11 @@ serve(async (req: Request) => {
     // garment_image: <base64 image WITHOUT data:image/... prefix>
     // category: "upperbody" | "lowerbody" | "dress"
     try {
-      let personBase64: string;
-      let garmentBase64: string;
+      let personImage: ImagePayload;
+      let garmentImage: ImagePayload;
 
       try {
-        [personBase64, garmentBase64] = await Promise.all([
+        [personImage, garmentImage] = await Promise.all([
           imageUrlToBase64(customerPhotoUrl),
           imageUrlToBase64(garmentPhotoUrl),
         ]);
@@ -770,13 +863,16 @@ serve(async (req: Request) => {
       }
 
       const requestPayload = {
-        person_image: personBase64,
-        garment_image: garmentBase64,
+        person_image: personImage.base64,
+        garment_image: garmentImage.base64,
         category: vtonCategory,
       };
 
       console.info(
-        `[PixelAPI Request] Submitting Virtual Try-On job: category="${vtonCategory}", person_image length=${personBase64.length}, garment_image length=${garmentBase64.length}`
+        `[PixelAPI Request] endpoint=/v1/virtual-tryon method=POST content_type=application/json ` +
+        `user_agent=BoutiqueVirtualTryon/1.0 category="${vtonCategory}" ` +
+        `person_image={format:raw_base64,mime:${personImage.mimeType},bytes:${personImage.byteSize},base64_length:${personImage.base64.length},data_url_prefix:${personImage.hadDataUrlPrefix},dimensions:${personImage.width || 'unknown'}x${personImage.height || 'unknown'}} ` +
+        `garment_image={format:raw_base64,mime:${garmentImage.mimeType},bytes:${garmentImage.byteSize},base64_length:${garmentImage.base64.length},data_url_prefix:${garmentImage.hadDataUrlPrefix},dimensions:${garmentImage.width || 'unknown'}x${garmentImage.height || 'unknown'}}`
       );
 
       const pixelResponse = await fetch('https://api.pixelapi.dev/v1/virtual-tryon', {
@@ -798,7 +894,7 @@ serve(async (req: Request) => {
         );
 
         console.error(
-          `[PixelAPI] HTTP ${pixelResponse.status}: ${providerMessage}`
+          `[PixelAPI Response] status=${pixelResponse.status} body=${sanitizePixelApiResponseBody(errorText)} message=${providerMessage}`
         );
 
         await supabaseAdmin.rpc('refund_shop_ai_credit', {
@@ -825,7 +921,7 @@ serve(async (req: Request) => {
             wasRefunded: true,
           }),
           {
-            status: 502,
+            status: providerResponseStatus(pixelResponse.status),
             headers: {
               ...corsHeaders,
               'Content-Type': 'application/json',
@@ -845,8 +941,9 @@ serve(async (req: Request) => {
       }
 
       console.info(
-        `[PixelAPI Diagnostics - Success] HTTP Status: 200 | Job ID: ${jobId} | ` +
-        `Immediate Status: ${pixelData.status || 'queued'}`
+        `[PixelAPI Response] status=${pixelResponse.status} job_id_present=true ` +
+        `immediate_status=${pixelData.status || 'queued'} result_url_present=${Boolean(pixelData.output_url || pixelData.result_url || pixelData.result_image_url || (Array.isArray(pixelData.result_urls) && pixelData.result_urls.length > 0))} ` +
+        `result_base64_present=${Boolean(pixelData.result_image_b64 || pixelData.image_base64)}`
       );
 
       const initialResultUrls = Array.isArray(pixelData.result_urls) ? pixelData.result_urls : [];
@@ -878,6 +975,11 @@ serve(async (req: Request) => {
             if (pollRes.ok) {
               const pollJson = await pollRes.json();
               const pollStatus = (pollJson.status || '').toLowerCase();
+              console.info(
+                `[PixelAPI Poll Response] status=${pollRes.status} job_status=${pollStatus || 'unknown'} ` +
+                `result_url_present=${Boolean(pollJson.output_url || pollJson.result_url || pollJson.result_image_url || (Array.isArray(pollJson.result_urls) && pollJson.result_urls.length > 0))} ` +
+                `result_base64_present=${Boolean(pollJson.result_image_b64 || pollJson.image_base64)}`
+              );
               const pollResultUrls = Array.isArray(pollJson.result_urls) ? pollJson.result_urls : [];
               const pollOutputUrl =
                 (pollResultUrls.length > 0 ? pollResultUrls[0] : null) ||
@@ -896,7 +998,7 @@ serve(async (req: Request) => {
                   pollRes.status,
                   JSON.stringify(pollJson)
                 );
-                console.error(`[PixelAPI] Job ${jobId} failed during server polling: ${failReason}`);
+                console.error(`[PixelAPI Poll Response] status=${pollRes.status} body=${sanitizePixelApiResponseBody(JSON.stringify(pollJson))} message=${failReason}`);
 
                 // Refund credit atomically on provider job failure
                 await supabaseAdmin.rpc('refund_shop_ai_credit', {

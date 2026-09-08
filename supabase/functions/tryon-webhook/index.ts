@@ -6,6 +6,14 @@
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.8';
 
+function sanitizeWebhookError(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  return value
+    .replace(/https?:\/\/[^\s"'`<>]+/g, '[URL_REDACTED]')
+    .replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, '[IMAGE_REDACTED]')
+    .slice(0, 500);
+}
+
 serve(async (req: Request) => {
   if (req.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
@@ -33,7 +41,7 @@ serve(async (req: Request) => {
       phase: payload.phase || payload.progress || null,
       has_output_url: Boolean(payload.output_url || payload.result_url || payload.result_image_url || payload.image_url || (Array.isArray(payload.result_urls) && payload.result_urls.length > 0)),
       has_base64_image: Boolean(payload.result_image_b64 || payload.image_base64),
-      error: payload.error || payload.error_message || null,
+      error: sanitizeWebhookError(payload.error || payload.error_message || null),
     }));
 
     const jobId = payload.job_id || payload.generation_id || payload.id;
